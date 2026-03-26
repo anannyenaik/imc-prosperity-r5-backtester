@@ -82,6 +82,10 @@ prosperity4btest sample.py 0 --limit EMERALDS:80 --limit TOMATOES:80
 
 Data files for Prosperity 4 rounds will be added as they become available.
 
+Round 0:
+Tomatoes: 80
+Emeralds: 80
+
 Conversions are not supported.
 
 ## Environment Variables
@@ -98,18 +102,3 @@ Follow these steps if you want to make changes to the backtester:
 5. Run `uv sync`.
 6. Any changes you make are now automatically taken into account the next time you run `prosperity4btest` inside the venv.
 
-## Publishing to PyPI
-
-Releases are built and published with [GitHub Actions](.github/workflows/build.yml) using [trusted publishing](https://docs.pypi.org/trusted-publishers/) (no long-lived PyPI token in the repo).
-
-1. On [PyPI](https://pypi.org), open **Account settings** → **Publishing** → **Add a new pending publisher**.
-2. Set **PyPI project name** to `prosperity4btest`, **Owner** to `nabayansaha`, **Repository name** to `imc-prosperity-4-backtester`, **Workflow name** to `build.yml`, and **Environment name** to `pypi`.
-3. On GitHub: repository **Settings** → **Environments** → create an environment named `pypi` (no protection rules required unless you want them).
-4. Tag and push a version; the workflow replaces `version = "0.0.0"` in `pyproject.toml` with the tag name and uploads the wheel and sdist:
-
-```sh
-git tag 0.1.0
-git push origin 0.1.0
-```
-
-The `publish` job only runs on tag pushes. The project name must match your pending publisher (`prosperity4btest`).
