@@ -48,6 +48,10 @@ $ prosperity4btest example/starter.py 1 --out example.log
 # Skip saving the output log to a file
 $ prosperity4btest example/starter.py 1 --no-out
 
+# Round 2: include fee-aware PnL assumption for Market Access Fee
+# (accepted = subtract Trader.bid() once from round 2 PnL)
+$ prosperity4btest sample.py 2 --round2-access accepted
+
 # Backtest on custom data
 # Requires the value passed to `--data` to be a path to a directory that is similar in structure to https://github.com/nabayansaha/imc-prosperity-4-backtester/tree/master/prosperity4bt/resources
 $ prosperity4btest example/starter.py 1 --data prosperity4bt/resources
@@ -56,6 +60,48 @@ $ prosperity4btest example/starter.py 1 --data prosperity4bt/resources
 # This may be helpful when debugging a broken trader
 $ prosperity4btest example/starter.py 1 --print
 ```
+
+## Round 2 Additions
+
+### Market Access Fee (`Trader.bid`)
+
+For round 2, if your algorithm exposes:
+
+```python
+class Trader:
+    def bid(self):
+        return 15
+```
+
+the backtester now reads this value and reports fee-aware round 2 summary numbers.
+
+- `bid()` is sanitized to a non-negative integer (invalid/negative => `0`).
+- The backtester cannot know acceptance locally (officially top 50% of bids), so use:
+  - `--round2-access unknown` (default): no deduction, informational only.
+  - `--round2-access accepted`: subtract bid once from round 2 PnL.
+  - `--round2-access rejected`: no deduction from round 2 PnL.
+
+### Manual Challenge Calculator (`invest` command)
+
+Use the built-in calculator for the "Invest & Expand" challenge:
+
+```sh
+# Uses default speed multiplier = 0.5
+prosperity4btest invest --research 55 --scale 35 --speed 10
+
+# Rank-based speed multiplier (rank 4 out of 20)
+prosperity4btest invest --research 55 --scale 35 --speed 10 --speed-rank 4 --players 20
+
+# Or directly specify assumed speed multiplier
+prosperity4btest invest --research 55 --scale 35 --speed 10 --speed-multiplier 0.7
+```
+
+Formula used:
+
+- `research(x) = 200_000 * ln(1 + x) / ln(101)`
+- `scale(x) = 7 * x / 100`
+- `gross_pnl = research * scale * speed_multiplier`
+- `net_pnl = gross_pnl - budget_used` with budget cap `50,000` XIRECs and total allocation <= 100%
 
 ## Order Matching
 

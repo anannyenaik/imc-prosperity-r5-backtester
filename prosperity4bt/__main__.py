@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime
 from functools import reduce
 from importlib import import_module, metadata, reload
+from math import log
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -14,6 +15,9 @@ from prosperity4bt.metrics import format_risk_metrics_block, risk_metrics_full_p
 from prosperity4bt.models import BacktestResult, TradeMatchingMode
 from prosperity4bt.open import open_visualizer
 from prosperity4bt.runner import run_backtest
+
+INVESTMENT_BUDGET_XIRECS = 50_000.0
+MAX_PILLAR_PERCENT = 100.0
 
 
 def parse_algorithm(algorithm: Path) -> Any:
@@ -190,6 +194,34 @@ def print_overall_summary(results: list[BacktestResult]) -> None:
     print(f"Total profit: {total_profit:,.0f}")
 
 
+def _extract_result_profit(result: BacktestResult) -> float:
+    last_timestamp = result.activity_logs[-1].timestamp
+    return sum(row.columns[-1] for row in reversed(result.activity_logs) if row.timestamp == last_timestamp)
+
+
+def _safe_int_bid(raw_bid: Any) -> int:
+    try:
+        bid = int(raw_bid)
+    except (TypeError, ValueError):
+        bid = 0
+    return max(0, bid)
+
+
+def _calculate_speed_multiplier_from_rank(rank: int, player_count: int) -> float:
+    if player_count <= 1:
+        return 0.9
+    # Linear interpolation from rank 1 -> 0.9 down to rank N -> 0.1
+    return 0.9 - ((rank - 1) * (0.8 / (player_count - 1)))
+
+
+def _research_value(research_pct: float) -> float:
+    return 200_000.0 * log(1.0 + research_pct) / log(1.0 + MAX_PILLAR_PERCENT)
+
+
+def _scale_value(scale_pct: float) -> float:
+    return 7.0 * (scale_pct / MAX_PILLAR_PERCENT)
+
+
 def format_path(path: Path) -> str:
     cwd = Path.cwd()
     if path.is_relative_to(cwd):
@@ -228,6 +260,18 @@ def cli(
             show_default=False,
         ),
     ] = [],
+    round2_access: Annotated[
+        str,
+        Option(
+            "--round2-access",
+            help=(
+                "How to treat Trader.bid() for round 2 in reported adjusted PnL: "
+                "'unknown' (default, no deduction), 'accepted' (subtract bid), "
+                "'rejected' (do not subtract bid)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = "unknown",
     version: Annotated[bool, Option("--version", "-v", help="Show the program's version number and exit.", is_eager=True, callback=version_callback)] = False,
 ) -> None:  # fmt: skip
     if out is not None and no_out:
@@ -250,6 +294,20 @@ def cli(
 
     show_progress_bars = not no_progress and not print_output
     limits_override = parse_limit_overrides(limit)
+    round2_access_normalized = round2_access.lower()
+    if round2_access_normalized not in {"unknown", "accepted", "rejected"}:
+        print("Error: --round2-access must be one of: unknown, accepted, rejected")
+        sys.exit(1)
+
+    trader_bid = 0
+    if hasattr(trader_module.Trader, "bid"):
+        try:
+            trader_bid = _safe_int_bid(trader_module.Trader().bid())
+        except Exception as e:
+            print(f"Warning: failed to call Trader.bid(); defaulting to 0 ({e})")
+            trader_bid = 0
+    if trader_bid > 0:
+        print(f"Trader Market Access Fee bid: {trader_bid:,d}")
 
     results = []
     for round_num, day_num in parsed_days:
@@ -282,6 +340,21 @@ def cli(
     full_metrics = risk_metrics_full_period(results)
     print("Risk metrics (full trading period):")
     print(format_risk_metrics_block(full_metrics))
+    round2_profit = sum(_extract_result_profit(r) for r in results if r.round_num == 2)
+    if round2_profit != 0 or any(r.round_num == 2 for r in results):
+        print("\nRound 2 fee-aware summary:")
+        print(f"  round2_profit_before_maf: {round2_profit:,.0f}")
+        print(f"  bid(): {trader_bid:,.0f}")
+        if round2_access_normalized == "accepted":
+            adjusted_round2_profit = round2_profit - trader_bid
+            print(f"  assumed_access: accepted")
+            print(f"  round2_profit_after_maf: {adjusted_round2_profit:,.0f}")
+        elif round2_access_normalized == "rejected":
+            print(f"  assumed_access: rejected")
+            print(f"  round2_profit_after_maf: {round2_profit:,.0f}")
+        else:
+            print("  assumed_access: unknown")
+            print("  round2_profit_after_maf: n/a (set --round2-access accepted|rejected)")
 
     if output_file is not None:
         merged_results = reduce(lambda a, b: merge_results(a, b, merge_pnl, not original_timestamps), results)
@@ -294,6 +367,70 @@ def cli(
 
 def main() -> None:
     app()
+
+
+@app.command("invest")
+def invest_cli(
+    research: Annotated[float, Option("--research", min=0.0, max=100.0, help="Research allocation percentage (0..100).")],
+    scale: Annotated[float, Option("--scale", min=0.0, max=100.0, help="Scale allocation percentage (0..100).")],
+    speed: Annotated[float, Option("--speed", min=0.0, max=100.0, help="Speed allocation percentage (0..100).")],
+    speed_multiplier: Annotated[
+        Optional[float],
+        Option(
+            "--speed-multiplier",
+            min=0.1,
+            max=0.9,
+            help="Optional direct speed multiplier estimate (0.1..0.9).",
+        ),
+    ] = None,
+    speed_rank: Annotated[
+        Optional[int],
+        Option("--speed-rank", min=1, help="Optional rank of your speed allocation (1 is highest)."),
+    ] = None,
+    player_count: Annotated[
+        Optional[int],
+        Option("--players", min=1, help="Optional number of participating players for rank-based speed multiplier."),
+    ] = None,
+) -> None:
+    total_alloc = research + scale + speed
+    if total_alloc > 100.0:
+        print(
+            f"Error: total allocation exceeds 100% (research+scale+speed={total_alloc:.2f}%). "
+            "Reduce allocations."
+        )
+        sys.exit(1)
+
+    used_budget = INVESTMENT_BUDGET_XIRECS * (total_alloc / 100.0)
+    research_out = _research_value(research)
+    scale_out = _scale_value(scale)
+
+    if speed_multiplier is not None and (speed_rank is not None or player_count is not None):
+        print("Error: choose either --speed-multiplier or (--speed-rank with --players), not both.")
+        sys.exit(1)
+
+    if speed_multiplier is None:
+        if speed_rank is not None or player_count is not None:
+            if speed_rank is None or player_count is None:
+                print("Error: both --speed-rank and --players are required for rank-based speed multiplier.")
+                sys.exit(1)
+            if speed_rank > player_count:
+                print("Error: --speed-rank cannot be greater than --players.")
+                sys.exit(1)
+            speed_multiplier = _calculate_speed_multiplier_from_rank(speed_rank, player_count)
+        else:
+            speed_multiplier = 0.5
+
+    gross_pnl = research_out * scale_out * speed_multiplier
+    net_pnl = gross_pnl - used_budget
+
+    print("Investment outcome:")
+    print(f"  allocations_pct: research={research:.2f}, scale={scale:.2f}, speed={speed:.2f}")
+    print(f"  budget_used: {used_budget:,.2f}")
+    print(f"  research_output: {research_out:,.2f}")
+    print(f"  scale_output: {scale_out:,.4f}")
+    print(f"  speed_multiplier: {speed_multiplier:.4f}")
+    print(f"  gross_pnl: {gross_pnl:,.2f}")
+    print(f"  net_pnl: {net_pnl:,.2f}")
 
 
 if __name__ == "__main__":

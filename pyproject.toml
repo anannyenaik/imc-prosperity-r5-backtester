@@ -1,7 +1,7 @@
 [project]
 name = "prosperity4btest"
 description = "Backtester for IMC Prosperity 4 algorithms"
-version = "1.0.0"
+version = "1.0.1"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Nabayan Saha", email = "nabayansaha214@gmail.com"}]
