@@ -5,6 +5,8 @@
 
 This repository contains a backtester for [IMC Prosperity 4](https://prosperity.imc.com/) algorithms, based on [jmerle's backtester for Prosperity 3](https://github.com/jmerle/imc-prosperity-3-backtester).
 
+PyPI package: [prosperity4btest](https://pypi.org/project/prosperity4btest/)
+
 ## Usage
 
 Basic usage:
