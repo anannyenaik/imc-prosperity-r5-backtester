@@ -443,15 +443,127 @@ class MicrochipModule:
         return next_targets
 
 
+class RobotModule:
+    PRODUCTS: tuple[Symbol, ...] = ("ROBOT_LAUNDRY", "ROBOT_VACUUMING")
+
+    WINDOW = 2000
+    MIN_HISTORY = 2000
+    ENTRY_Z = 2.25
+    HOLD_TO_FLIP = True
+    EXIT_Z: Optional[float] = None
+
+    MIN_STD = 1.0
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    HISTORY_LIMIT = 2000
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[list[int], dict[Symbol, int]]:
+        return [], {product: 0 for product in self.PRODUCTS}
+
+    def load_state(self, loaded) -> tuple[list[int], dict[Symbol, int]]:
+        history, targets = self.empty_state()
+        if not isinstance(loaded, dict):
+            return history, targets
+
+        history = clean_history(loaded.get("h", []), self.HISTORY_LIMIT)
+        raw_targets = loaded.get("t", {})
+        if isinstance(raw_targets, dict):
+            for product in self.PRODUCTS:
+                try:
+                    target = int(raw_targets.get(product, 0))
+                except (TypeError, ValueError):
+                    target = 0
+                targets[product] = clamp(target, -self.TARGET_SIZE, self.TARGET_SIZE)
+
+        return history, targets
+
+    def dump_state(self, history: list[int], targets: dict[Symbol, int]) -> dict:
+        return {
+            "h": history[-self.HISTORY_LIMIT:],
+            "t": {product: int(targets.get(product, 0)) for product in self.PRODUCTS},
+        }
+
+    def targets_from_signal(
+        self,
+        previous_targets: dict[Symbol, int],
+        z_score: Optional[float],
+        has_min_history: bool,
+    ) -> dict[Symbol, int]:
+        laundry, vacuuming = self.PRODUCTS
+        if not has_min_history or z_score is None:
+            if not has_min_history:
+                return {laundry: 0, vacuuming: 0}
+            return dict(previous_targets)
+        if z_score > self.ENTRY_Z:
+            return {laundry: -self.TARGET_SIZE, vacuuming: self.TARGET_SIZE}
+        if z_score < -self.ENTRY_Z:
+            return {laundry: self.TARGET_SIZE, vacuuming: -self.TARGET_SIZE}
+        if not self.HOLD_TO_FLIP and self.EXIT_Z is not None and abs(z_score) < self.EXIT_Z:
+            return {laundry: 0, vacuuming: 0}
+        return dict(previous_targets)
+
+    def run(
+        self,
+        state: TradingState,
+        history: list[int],
+        targets: dict[Symbol, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[Symbol, int]:
+        mids: dict[Symbol, float] = {}
+        for product in self.PRODUCTS:
+            order_depth = state.order_depths.get(product)
+            if order_depth is None:
+                return targets
+            mid = mid_price(order_depth)
+            if mid is None:
+                return targets
+            mids[product] = mid
+
+        laundry, vacuuming = self.PRODUCTS
+        residual = int(round((mids[laundry] - mids[vacuuming]) * self.RESIDUAL_SCALE))
+        has_min_history = len(history) >= self.MIN_HISTORY
+        z_score = rolling_z_score(
+            history,
+            residual,
+            self.WINDOW,
+            self.MIN_HISTORY,
+            self.MIN_STD,
+            self.RESIDUAL_SCALE,
+        )
+        next_targets = self.targets_from_signal(targets, z_score, has_min_history)
+
+        for product in self.PRODUCTS:
+            orders = order_to_target(
+                product,
+                state.order_depths[product],
+                state.position.get(product, 0),
+                next_targets[product],
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders:
+                result[product] = orders
+
+        history.append(residual)
+        if len(history) > self.HISTORY_LIMIT:
+            del history[: len(history) - self.HISTORY_LIMIT]
+
+        return next_targets
+
+
 class Trader:
     PEBBLES_STATE_KEY = "p"
     TRANSLATOR_STATE_KEY = "tr"
     MICROCHIP_STATE_KEY = "mc"
+    ROBOT_STATE_KEY = "rb"
 
     def __init__(self) -> None:
         self.pebbles = PebblesModule()
         self.translator = TranslatorModule()
         self.microchip = MicrochipModule()
+        self.robot = RobotModule()
 
     def _load_json(self, trader_data: str) -> dict:
         if not trader_data:
@@ -470,12 +582,14 @@ class Trader:
             loaded.get(self.TRANSLATOR_STATE_KEY, {})
         )
         microchip_history, microchip_targets = self.microchip.load_state(loaded.get(self.MICROCHIP_STATE_KEY, {}))
+        robot_history, robot_targets = self.robot.load_state(loaded.get(self.ROBOT_STATE_KEY, {}))
 
         result: dict[Symbol, list[Order]] = {}
 
         next_pebbles_targets = self.pebbles.run(state, pebbles_histories, pebbles_targets, result)
         next_translator_targets = self.translator.run(state, translator_histories, translator_targets, result)
         next_microchip_targets = self.microchip.run(state, microchip_history, microchip_targets, result)
+        next_robot_targets = self.robot.run(state, robot_history, robot_targets, result)
 
         trader_data = json.dumps(
             {
@@ -485,6 +599,7 @@ class Trader:
                     next_translator_targets,
                 ),
                 self.MICROCHIP_STATE_KEY: self.microchip.dump_state(microchip_history, next_microchip_targets),
+                self.ROBOT_STATE_KEY: self.robot.dump_state(robot_history, next_robot_targets),
             },
             separators=(",", ":"),
         )

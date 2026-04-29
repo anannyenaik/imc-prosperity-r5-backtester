@@ -9,30 +9,34 @@ PyPI package: [prosperity4btest](https://pypi.org/project/prosperity4btest/)
 
 ## R5 Final Strategy
 
-Result: the final production file is `strategies/r5_trader.py`.
+Result: the exact final file to submit is `strategies/r5_trader.py`.
 
 It contains the frozen combined R5 strategy with separate module logic for:
 - Pebbles: `PEBBLES_XS`, `PEBBLES_S`, `PEBBLES_M`, `PEBBLES_L`, `PEBBLES_XL`
 - Translator: `TRANSLATOR_SPACE_GRAY`, `TRANSLATOR_ASTRO_BLACK`, `TRANSLATOR_ECLIPSE_CHARCOAL`, `TRANSLATOR_GRAPHITE_MIST`, `TRANSLATOR_VOID_BLUE`
 - Microchip: `MICROCHIP_OVAL`, `MICROCHIP_TRIANGLE`
+- Robot: `ROBOT_LAUNDRY`, `ROBOT_VACUUMING`
 
-The standalone module references are kept in `strategies/archive/`. Research and validation scripts live in `research/`. Generated logs belong in `backtests/`; generated summaries belong in `research_outputs/`. Those generated outputs are ignored by default.
+Robot uses raw `mid(ROBOT_LAUNDRY) - mid(ROBOT_VACUUMING)` mean reversion with `window=2000`, `min_history=2000`, `entry_z=2.25`, `target=10`, hold-to-flip, bounded history, and visible L1 crossing only.
+
+`strategies/r5_trader.py` is the only live production trader. The standalone module references, rejected candidates, and research-only challengers are kept in `strategies/archive/` and are not submission candidates. Research and validation scripts live in `research/`. Generated logs belong in `backtests/`; generated summaries belong in `research_outputs/`. Those generated outputs are ignored by default.
 
 Expected public Round 5 PnL for `strategies/r5_trader.py`, using days 2, 3 and 4 with `--match-trades worse`:
-- Day 2: `236,819`
-- Day 3: `126,476`
-- Day 4: `222,473`
-- Total: `585,768`
+- Day 2: `257,922`
+- Day 3: `148,634`
+- Day 4: `245,313`
+- Total: `651,869`
 
 Standalone module totals used for additivity checks:
 - Pebbles: `363,835`
 - Translator: `106,263`
 - Microchip: `115,670`
+- Robot: `66,101`
 
 Run the final backtest from the repository root:
 
 ```powershell
-python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades worse --merge-pnl --out backtests/r5_trader_worse.log --no-progress
+python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades worse --merge-pnl --out backtests/r5_trader_final_worse.log --no-progress
 ```
 
 Exact final validation commands:
@@ -52,17 +56,20 @@ $limits = @(
   "--limit", "TRANSLATOR_GRAPHITE_MIST:10",
   "--limit", "TRANSLATOR_VOID_BLUE:10",
   "--limit", "MICROCHIP_OVAL:10",
-  "--limit", "MICROCHIP_TRIANGLE:10"
+  "--limit", "MICROCHIP_TRIANGLE:10",
+  "--limit", "ROBOT_LAUNDRY:10",
+  "--limit", "ROBOT_VACUUMING:10",
+  "--limit", "ROBOT_DISHES:10",
+  "--limit", "ROBOT_MOPPING:10",
+  "--limit", "ROBOT_IRONING:10"
 )
 
 foreach ($mode in "worse", "all", "none") {
-  python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades $mode --merge-pnl --out "backtests/r5_trader_$mode.log" --no-progress @limits
+  python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades $mode --merge-pnl --out "backtests/r5_trader_final_$mode.log" --no-progress @limits
 }
-
-python research/r5_combined_validation.py
 ```
 
-The production strategy does not use timestamp logic, day logic, warm starts, public-history seeds, passive orders, L2 book logic, or extra traded products.
+The production strategy does not use timestamp logic, day logic, warm starts, public-history seeds, passive orders, L2 book logic, market-trade features, or previous-round products. Robot orders are restricted to `ROBOT_LAUNDRY` and `ROBOT_VACUUMING`.
 
 ## Usage
 
