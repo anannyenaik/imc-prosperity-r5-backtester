@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 from typing import Optional
@@ -34,6 +35,66 @@ def clean_history(raw_values, history_limit: int) -> list[int]:
     return cleaned
 
 
+def clean_int16_history(raw_values, history_limit: int) -> list[int]:
+    if isinstance(raw_values, str):
+        try:
+            raw_bytes = base64.b64decode(raw_values.encode("ascii"), validate=True)
+        except Exception:
+            return []
+        if len(raw_bytes) % 2 != 0:
+            return []
+        values = [
+            int.from_bytes(raw_bytes[index : index + 2], "big", signed=True)
+            for index in range(0, len(raw_bytes), 2)
+        ]
+        return values[-history_limit:]
+    return clean_history(raw_values, history_limit)
+
+
+def dump_int16_history(values: list[int]) -> object:
+    raw_bytes = bytearray()
+    for value in values:
+        if value < -32768 or value > 32767:
+            return values
+        raw_bytes.extend(value.to_bytes(2, "big", signed=True))
+    return base64.b64encode(bytes(raw_bytes)).decode("ascii")
+
+
+def clean_offset_int16_history(raw_values, history_limit: int) -> list[int]:
+    if isinstance(raw_values, dict):
+        try:
+            offset = int(raw_values.get("o", 0))
+            raw_data = raw_values.get("d", "")
+            if not isinstance(raw_data, str):
+                return []
+            raw_bytes = base64.b64decode(raw_data.encode("ascii"), validate=True)
+        except Exception:
+            return []
+        if len(raw_bytes) % 2 != 0:
+            return []
+        values = [
+            int.from_bytes(raw_bytes[index : index + 2], "big", signed=True) + offset
+            for index in range(0, len(raw_bytes), 2)
+        ]
+        return values[-history_limit:]
+    return clean_int16_history(raw_values, history_limit)
+
+
+def dump_offset_int16_history(values: list[int]) -> object:
+    if not values:
+        return ""
+    lower = min(values)
+    upper = max(values)
+    offset = (lower + upper) // 2
+    shifted_values = [value - offset for value in values]
+    raw_bytes = bytearray()
+    for value in shifted_values:
+        if value < -32768 or value > 32767:
+            return values
+        raw_bytes.extend(value.to_bytes(2, "big", signed=True))
+    return {"o": offset, "d": base64.b64encode(bytes(raw_bytes)).decode("ascii")}
+
+
 def rolling_z_score(
     history: list[int],
     current_residual: int,
@@ -54,6 +115,46 @@ def rolling_z_score(
         return None
 
     return (current_residual - mean) / std
+
+
+def residual_std_score(
+    history: list[int],
+    current_residual: int,
+    window: int,
+    min_history: int,
+) -> Optional[float]:
+    lookback = history[-window:]
+    if len(lookback) < min_history:
+        return None
+
+    mean = sum(lookback) / len(lookback)
+    mean_square = sum(value * value for value in lookback) / len(lookback)
+    variance = max(0.0, mean_square - mean * mean)
+    std = math.sqrt(variance)
+    if std <= 0.0:
+        return None
+
+    return current_residual / std
+
+
+def rolling_spread_z_score(
+    history: list[int],
+    current_value: int,
+    window: int,
+    min_history: int,
+) -> Optional[float]:
+    lookback = history[-window:]
+    if len(lookback) < min_history:
+        return None
+
+    mean = sum(lookback) / len(lookback)
+    mean_square = sum(value * value for value in lookback) / len(lookback)
+    variance = max(0.0, mean_square - mean * mean)
+    std = math.sqrt(variance)
+    if std <= 0.0:
+        return None
+
+    return (current_value - mean) / std
 
 
 def order_to_target(
@@ -553,17 +654,834 @@ class RobotModule:
         return next_targets
 
 
+class SnackpackEwmaModule:
+    PRODUCTS: tuple[Symbol, ...] = (
+        "SNACKPACK_CHOCOLATE",
+        "SNACKPACK_VANILLA",
+        "SNACKPACK_PISTACHIO",
+        "SNACKPACK_STRAWBERRY",
+        "SNACKPACK_RASPBERRY",
+    )
+    PAIRS: tuple[tuple[str, Symbol, Symbol], ...] = (
+        ("cv", "SNACKPACK_CHOCOLATE", "SNACKPACK_VANILLA"),
+        ("rs", "SNACKPACK_RASPBERRY", "SNACKPACK_STRAWBERRY"),
+        ("pr", "SNACKPACK_PISTACHIO", "SNACKPACK_RASPBERRY"),
+    )
+
+    EMA_ALPHA = 0.00005
+    ROLLING_STD_WINDOW = 1000
+    MIN_HISTORY = 500
+    ENTRY_Z = 2.75
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    HISTORY_LIMIT = 1000
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[dict[str, list[int]], dict[str, float], dict[str, int]]:
+        return (
+            {pair_name: [] for pair_name, _, _ in self.PAIRS},
+            {},
+            {pair_name: 0 for pair_name, _, _ in self.PAIRS},
+        )
+
+    def load_state(self, loaded) -> tuple[dict[str, list[int]], dict[str, float], dict[str, int]]:
+        histories, emas, pair_states = self.empty_state()
+        if not isinstance(loaded, dict):
+            return histories, emas, pair_states
+
+        raw_histories = loaded.get("h", {})
+        if isinstance(raw_histories, dict):
+            for pair_name, _, _ in self.PAIRS:
+                histories[pair_name] = clean_history(raw_histories.get(pair_name, []), self.HISTORY_LIMIT)
+
+        raw_emas = loaded.get("e", {})
+        if isinstance(raw_emas, dict):
+            for pair_name, _, _ in self.PAIRS:
+                try:
+                    emas[pair_name] = float(raw_emas[pair_name])
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        raw_pair_states = loaded.get("s", {})
+        if isinstance(raw_pair_states, dict):
+            for pair_name, _, _ in self.PAIRS:
+                try:
+                    pair_state = int(raw_pair_states.get(pair_name, 0))
+                except (TypeError, ValueError):
+                    pair_state = 0
+                pair_states[pair_name] = clamp(pair_state, -1, 1)
+
+        return histories, emas, pair_states
+
+    def dump_state(
+        self,
+        histories: dict[str, list[int]],
+        emas: dict[str, float],
+        pair_states: dict[str, int],
+    ) -> dict:
+        return {
+            "h": {pair_name: histories.get(pair_name, [])[-self.HISTORY_LIMIT:] for pair_name, _, _ in self.PAIRS},
+            "e": {pair_name: float(emas[pair_name]) for pair_name, _, _ in self.PAIRS if pair_name in emas},
+            "s": {pair_name: int(pair_states.get(pair_name, 0)) for pair_name, _, _ in self.PAIRS},
+        }
+
+    def next_pair_state(self, current_state: int, residual: float, z_score: Optional[float]) -> int:
+        if current_state == 1:
+            return 0 if residual >= 0.0 else current_state
+        if current_state == -1:
+            return 0 if residual <= 0.0 else current_state
+        if z_score is None:
+            return 0
+        if z_score > self.ENTRY_Z:
+            return -1
+        if z_score < -self.ENTRY_Z:
+            return 1
+        return 0
+
+    def run(
+        self,
+        state: TradingState,
+        histories: dict[str, list[int]],
+        emas: dict[str, float],
+        pair_states: dict[str, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[str, int]:
+        mids: dict[Symbol, float] = {}
+        for product in self.PRODUCTS:
+            order_depth = state.order_depths.get(product)
+            if order_depth is None:
+                return pair_states
+            mid = mid_price(order_depth)
+            if mid is None:
+                return pair_states
+            mids[product] = mid
+
+        diffs: dict[str, float] = {}
+        scaled_residuals: dict[str, int] = {}
+        next_pair_states: dict[str, int] = {}
+
+        for pair_name, product_a, product_b in self.PAIRS:
+            diff = mids[product_a] - mids[product_b]
+            if pair_name not in emas:
+                emas[pair_name] = diff
+
+            residual = diff - emas[pair_name]
+            scaled_residual = int(round(residual * self.RESIDUAL_SCALE))
+            z_score = residual_std_score(
+                histories[pair_name],
+                scaled_residual,
+                self.ROLLING_STD_WINDOW,
+                self.MIN_HISTORY,
+            )
+
+            diffs[pair_name] = diff
+            scaled_residuals[pair_name] = scaled_residual
+            next_pair_states[pair_name] = self.next_pair_state(pair_states.get(pair_name, 0), residual, z_score)
+
+        aggregate_targets = {product: 0 for product in self.PRODUCTS}
+        for pair_name, product_a, product_b in self.PAIRS:
+            pair_state = next_pair_states[pair_name]
+            if pair_state == 0:
+                continue
+            aggregate_targets[product_a] += pair_state * self.TARGET_SIZE
+            aggregate_targets[product_b] -= pair_state * self.TARGET_SIZE
+
+        for product in self.PRODUCTS:
+            target = clamp(aggregate_targets[product], -self.POSITION_LIMIT, self.POSITION_LIMIT)
+            orders = order_to_target(
+                product,
+                state.order_depths[product],
+                state.position.get(product, 0),
+                target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders:
+                result[product] = orders
+
+        for pair_name, _, _ in self.PAIRS:
+            history = histories[pair_name]
+            history.append(scaled_residuals[pair_name])
+            if len(history) > self.HISTORY_LIMIT:
+                del history[: len(history) - self.HISTORY_LIMIT]
+            emas[pair_name] += self.EMA_ALPHA * (diffs[pair_name] - emas[pair_name])
+
+        return next_pair_states
+
+
+class SleepPodModule:
+    PRODUCTS: tuple[Symbol, ...] = (
+        "SLEEP_POD_POLYESTER",
+        "SLEEP_POD_COTTON",
+        "SLEEP_POD_LAMB_WOOL",
+        "SLEEP_POD_NYLON",
+    )
+    PC_PAIR: tuple[Symbol, Symbol] = ("SLEEP_POD_POLYESTER", "SLEEP_POD_COTTON")
+    LN_PAIR: tuple[Symbol, Symbol] = ("SLEEP_POD_LAMB_WOOL", "SLEEP_POD_NYLON")
+
+    PC_EMA_ALPHA = 0.0001
+    PC_ROLLING_STD_WINDOW = 1000
+    PC_MIN_HISTORY = 500
+    PC_ENTRY_Z = 2.75
+
+    LN_WINDOW = 1000
+    LN_MIN_HISTORY = 1000
+    LN_ENTRY_Z = 2.75
+
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    HISTORY_LIMIT = 1000
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[list[int], Optional[float], int, list[int], int]:
+        return [], None, 0, [], 0
+
+    def load_state(self, loaded) -> tuple[list[int], Optional[float], int, list[int], int]:
+        pc_history, pc_ema, pc_state, ln_history, ln_state = self.empty_state()
+        if not isinstance(loaded, dict):
+            return pc_history, pc_ema, pc_state, ln_history, ln_state
+
+        pc_history = clean_history(loaded.get("ph", []), self.HISTORY_LIMIT)
+        ln_history = clean_history(loaded.get("lh", []), self.HISTORY_LIMIT)
+
+        try:
+            pc_ema = float(loaded["pe"])
+        except (KeyError, TypeError, ValueError):
+            pc_ema = None
+
+        try:
+            pc_state = int(loaded.get("ps", 0))
+        except (TypeError, ValueError):
+            pc_state = 0
+
+        try:
+            ln_state = int(loaded.get("ls", 0))
+        except (TypeError, ValueError):
+            ln_state = 0
+
+        return pc_history, pc_ema, clamp(pc_state, -1, 1), ln_history, clamp(ln_state, -1, 1)
+
+    def dump_state(
+        self,
+        pc_history: list[int],
+        pc_ema: Optional[float],
+        pc_state: int,
+        ln_history: list[int],
+        ln_state: int,
+    ) -> dict:
+        dumped = {
+            "ph": pc_history[-self.HISTORY_LIMIT:],
+            "ps": int(pc_state),
+            "lh": ln_history[-self.HISTORY_LIMIT:],
+            "ls": int(ln_state),
+        }
+        if pc_ema is not None:
+            dumped["pe"] = float(pc_ema)
+        return dumped
+
+    def next_ewma_state(self, current_state: int, residual: float, z_score: Optional[float]) -> int:
+        if current_state == 1:
+            return 0 if residual >= 0.0 else current_state
+        if current_state == -1:
+            return 0 if residual <= 0.0 else current_state
+        if z_score is None:
+            return 0
+        if z_score > self.PC_ENTRY_Z:
+            return -1
+        if z_score < -self.PC_ENTRY_Z:
+            return 1
+        return 0
+
+    def next_raw_state(self, current_state: int, z_score: Optional[float], has_min_history: bool) -> int:
+        if not has_min_history or z_score is None:
+            return 0 if not has_min_history else current_state
+        if z_score > self.LN_ENTRY_Z:
+            return -1
+        if z_score < -self.LN_ENTRY_Z:
+            return 1
+        return current_state
+
+    def run(
+        self,
+        state: TradingState,
+        pc_history: list[int],
+        pc_ema: Optional[float],
+        pc_state: int,
+        ln_history: list[int],
+        ln_state: int,
+        result: dict[Symbol, list[Order]],
+    ) -> tuple[Optional[float], int, int]:
+        mids: dict[Symbol, float] = {}
+        for product in self.PRODUCTS:
+            order_depth = state.order_depths.get(product)
+            if order_depth is None:
+                return pc_ema, pc_state, ln_state
+            mid = mid_price(order_depth)
+            if mid is None:
+                return pc_ema, pc_state, ln_state
+            mids[product] = mid
+
+        pc_a, pc_b = self.PC_PAIR
+        pc_diff = mids[pc_a] - mids[pc_b]
+        if pc_ema is None:
+            pc_ema = pc_diff
+        pc_residual = pc_diff - pc_ema
+        scaled_pc_residual = int(round(pc_residual * self.RESIDUAL_SCALE))
+        pc_z_score = residual_std_score(
+            pc_history,
+            scaled_pc_residual,
+            self.PC_ROLLING_STD_WINDOW,
+            self.PC_MIN_HISTORY,
+        )
+        next_pc_state = self.next_ewma_state(pc_state, pc_residual, pc_z_score)
+
+        ln_a, ln_b = self.LN_PAIR
+        ln_diff = mids[ln_a] - mids[ln_b]
+        scaled_ln_diff = int(round(ln_diff * self.RESIDUAL_SCALE))
+        ln_has_min_history = len(ln_history) >= self.LN_MIN_HISTORY
+        ln_z_score = rolling_spread_z_score(
+            ln_history,
+            scaled_ln_diff,
+            self.LN_WINDOW,
+            self.LN_MIN_HISTORY,
+        )
+        next_ln_state = self.next_raw_state(ln_state, ln_z_score, ln_has_min_history)
+
+        targets = {product: 0 for product in self.PRODUCTS}
+        targets[pc_a] += next_pc_state * self.TARGET_SIZE
+        targets[pc_b] -= next_pc_state * self.TARGET_SIZE
+        targets[ln_a] += next_ln_state * self.TARGET_SIZE
+        targets[ln_b] -= next_ln_state * self.TARGET_SIZE
+
+        for product in self.PRODUCTS:
+            orders = order_to_target(
+                product,
+                state.order_depths[product],
+                state.position.get(product, 0),
+                targets[product],
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders:
+                result[product] = orders
+
+        pc_history.append(scaled_pc_residual)
+        if len(pc_history) > self.HISTORY_LIMIT:
+            del pc_history[: len(pc_history) - self.HISTORY_LIMIT]
+        pc_ema += self.PC_EMA_ALPHA * (pc_diff - pc_ema)
+
+        ln_history.append(scaled_ln_diff)
+        if len(ln_history) > self.HISTORY_LIMIT:
+            del ln_history[: len(ln_history) - self.HISTORY_LIMIT]
+
+        return pc_ema, next_pc_state, next_ln_state
+
+
+class GalaxyPairsModule:
+    PAIRS: tuple[tuple[str, Symbol, Symbol, int, int, float], ...] = (
+        ("dmbh", "GALAXY_SOUNDS_DARK_MATTER", "GALAXY_SOUNDS_BLACK_HOLES", 3000, 3000, 2.50),
+        ("swsf", "GALAXY_SOUNDS_SOLAR_WINDS", "GALAXY_SOUNDS_SOLAR_FLAMES", 1500, 1500, 3.00),
+    )
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    RESIDUAL_SCALE = 10
+    HOLD_TO_FLIP = True
+
+    def empty_state(self) -> tuple[dict[str, list[int]], dict[str, int]]:
+        return (
+            {name: [] for name, *_ in self.PAIRS},
+            {name: 0 for name, *_ in self.PAIRS},
+        )
+
+    def load_state(self, loaded) -> tuple[dict[str, list[int]], dict[str, int]]:
+        histories, targets = self.empty_state()
+        if not isinstance(loaded, dict):
+            return histories, targets
+        raw_histories = loaded.get("h", {})
+        if isinstance(raw_histories, dict):
+            for name, _, _, window, _, _ in self.PAIRS:
+                histories[name] = clean_history(raw_histories.get(name, []), window)
+        raw_targets = loaded.get("t", {})
+        if isinstance(raw_targets, dict):
+            for name, *_ in self.PAIRS:
+                try:
+                    target = int(raw_targets.get(name, 0))
+                except (TypeError, ValueError):
+                    target = 0
+                targets[name] = clamp(target, -self.TARGET_SIZE, self.TARGET_SIZE)
+        return histories, targets
+
+    def dump_state(self, histories: dict[str, list[int]], targets: dict[str, int]) -> dict:
+        return {
+            "h": {name: histories.get(name, [])[-window:] for name, _, _, window, *_ in self.PAIRS},
+            "t": {name: int(targets.get(name, 0)) for name, *_ in self.PAIRS},
+        }
+
+    def target_from_signal(
+        self,
+        previous_target: int,
+        z_score: Optional[float],
+        has_min_history: bool,
+        entry_z: float,
+    ) -> int:
+        if not has_min_history or z_score is None:
+            return 0 if not has_min_history else previous_target
+        if z_score > entry_z:
+            return -self.TARGET_SIZE
+        if z_score < -entry_z:
+            return self.TARGET_SIZE
+        return previous_target
+
+    def run(
+        self,
+        state: TradingState,
+        histories: dict[str, list[int]],
+        targets: dict[str, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[str, int]:
+        next_targets: dict[str, int] = {name: targets.get(name, 0) for name, *_ in self.PAIRS}
+        diffs: dict[str, int] = {}
+        active_pairs: list[tuple[str, Symbol, Symbol, int, int, float]] = []
+
+        for pair in self.PAIRS:
+            name, prod_a, prod_b, window, min_history, entry_z = pair
+            depth_a = state.order_depths.get(prod_a)
+            depth_b = state.order_depths.get(prod_b)
+            if depth_a is None or depth_b is None:
+                continue
+            mid_a = mid_price(depth_a)
+            mid_b = mid_price(depth_b)
+            if mid_a is None or mid_b is None:
+                continue
+            diff = int(round((mid_a - mid_b) * self.RESIDUAL_SCALE))
+            history = histories[name]
+            has_min_history = len(history) >= min_history
+            z_score = rolling_spread_z_score(history, diff, window, min_history)
+            next_targets[name] = self.target_from_signal(
+                targets.get(name, 0), z_score, has_min_history, entry_z
+            )
+            diffs[name] = diff
+            active_pairs.append(pair)
+
+        for name, prod_a, prod_b, _, _, _ in active_pairs:
+            target = next_targets[name]
+            orders_a = order_to_target(
+                prod_a,
+                state.order_depths[prod_a],
+                state.position.get(prod_a, 0),
+                target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_a:
+                result[prod_a] = orders_a
+            orders_b = order_to_target(
+                prod_b,
+                state.order_depths[prod_b],
+                state.position.get(prod_b, 0),
+                -target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_b:
+                result[prod_b] = orders_b
+
+        for name, _, _, window, _, _ in active_pairs:
+            history = histories[name]
+            history.append(diffs[name])
+            if len(history) > window:
+                del history[: len(history) - window]
+
+        return next_targets
+
+
+class OxygenPairsModule:
+    PAIRS: tuple[tuple[str, Symbol, Symbol, int, int, float], ...] = (
+        ("cg", "OXYGEN_SHAKE_CHOCOLATE", "OXYGEN_SHAKE_GARLIC", 3500, 3500, 2.00),
+        ("em", "OXYGEN_SHAKE_EVENING_BREATH", "OXYGEN_SHAKE_MINT", 500, 500, 3.00),
+    )
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[dict[str, list[int]], dict[str, int]]:
+        return (
+            {name: [] for name, *_ in self.PAIRS},
+            {name: 0 for name, *_ in self.PAIRS},
+        )
+
+    def load_state(self, loaded) -> tuple[dict[str, list[int]], dict[str, int]]:
+        histories, targets = self.empty_state()
+        if not isinstance(loaded, dict):
+            return histories, targets
+        raw_histories = loaded.get("h", {})
+        if isinstance(raw_histories, dict):
+            for name, _, _, window, _, _ in self.PAIRS:
+                histories[name] = clean_history(raw_histories.get(name, []), window)
+        raw_targets = loaded.get("t", {})
+        if isinstance(raw_targets, dict):
+            for name, *_ in self.PAIRS:
+                try:
+                    target = int(raw_targets.get(name, 0))
+                except (TypeError, ValueError):
+                    target = 0
+                targets[name] = clamp(target, -self.TARGET_SIZE, self.TARGET_SIZE)
+        return histories, targets
+
+    def dump_state(self, histories: dict[str, list[int]], targets: dict[str, int]) -> dict:
+        return {
+            "h": {name: histories.get(name, [])[-window:] for name, _, _, window, *_ in self.PAIRS},
+            "t": {name: int(targets.get(name, 0)) for name, *_ in self.PAIRS},
+        }
+
+    def target_from_signal(
+        self,
+        previous_target: int,
+        z_score: Optional[float],
+        has_min_history: bool,
+        entry_z: float,
+    ) -> int:
+        if not has_min_history or z_score is None:
+            return 0 if not has_min_history else previous_target
+        if z_score > entry_z:
+            return -self.TARGET_SIZE
+        if z_score < -entry_z:
+            return self.TARGET_SIZE
+        return previous_target
+
+    def run(
+        self,
+        state: TradingState,
+        histories: dict[str, list[int]],
+        targets: dict[str, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[str, int]:
+        next_targets: dict[str, int] = {name: targets.get(name, 0) for name, *_ in self.PAIRS}
+        diffs: dict[str, int] = {}
+        active_pairs: list[tuple[str, Symbol, Symbol, int, int, float]] = []
+
+        for pair in self.PAIRS:
+            name, prod_a, prod_b, window, min_history, entry_z = pair
+            depth_a = state.order_depths.get(prod_a)
+            depth_b = state.order_depths.get(prod_b)
+            if depth_a is None or depth_b is None:
+                continue
+            mid_a = mid_price(depth_a)
+            mid_b = mid_price(depth_b)
+            if mid_a is None or mid_b is None:
+                continue
+            diff = int(round((mid_a - mid_b) * self.RESIDUAL_SCALE))
+            history = histories[name]
+            has_min_history = len(history) >= min_history
+            z_score = rolling_spread_z_score(history, diff, window, min_history)
+            next_targets[name] = self.target_from_signal(
+                targets.get(name, 0), z_score, has_min_history, entry_z
+            )
+            diffs[name] = diff
+            active_pairs.append(pair)
+
+        for name, prod_a, prod_b, _, _, _ in active_pairs:
+            target = next_targets[name]
+            orders_a = order_to_target(
+                prod_a,
+                state.order_depths[prod_a],
+                state.position.get(prod_a, 0),
+                target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_a:
+                result[prod_a] = orders_a
+            orders_b = order_to_target(
+                prod_b,
+                state.order_depths[prod_b],
+                state.position.get(prod_b, 0),
+                -target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_b:
+                result[prod_b] = orders_b
+
+        for name, _, _, window, _, _ in active_pairs:
+            history = histories[name]
+            history.append(diffs[name])
+            if len(history) > window:
+                del history[: len(history) - window]
+
+        return next_targets
+
+
+class UVVisorPairsModule:
+    PAIRS: tuple[tuple[str, Symbol, Symbol, int, int, float], ...] = (
+        ("ym", "UV_VISOR_YELLOW", "UV_VISOR_MAGENTA", 1500, 1500, 2.75),
+        ("ar", "UV_VISOR_AMBER", "UV_VISOR_RED", 2500, 2500, 2.50),
+    )
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[dict[str, list[int]], dict[str, int]]:
+        return (
+            {name: [] for name, *_ in self.PAIRS},
+            {name: 0 for name, *_ in self.PAIRS},
+        )
+
+    def load_state(self, loaded) -> tuple[dict[str, list[int]], dict[str, int]]:
+        histories, targets = self.empty_state()
+        if not isinstance(loaded, dict):
+            return histories, targets
+        raw_histories = loaded.get("h", {})
+        if isinstance(raw_histories, dict):
+            for name, _, _, window, _, _ in self.PAIRS:
+                histories[name] = clean_int16_history(raw_histories.get(name, []), window)
+        raw_targets = loaded.get("t", {})
+        if isinstance(raw_targets, dict):
+            for name, *_ in self.PAIRS:
+                try:
+                    target = int(raw_targets.get(name, 0))
+                except (TypeError, ValueError):
+                    target = 0
+                targets[name] = clamp(target, -self.TARGET_SIZE, self.TARGET_SIZE)
+        return histories, targets
+
+    def dump_state(self, histories: dict[str, list[int]], targets: dict[str, int]) -> dict:
+        return {
+            "h": {name: dump_int16_history(histories.get(name, [])[-window:]) for name, _, _, window, *_ in self.PAIRS},
+            "t": {name: int(targets.get(name, 0)) for name, *_ in self.PAIRS},
+        }
+
+    def target_from_signal(
+        self,
+        previous_target: int,
+        z_score: Optional[float],
+        has_min_history: bool,
+        entry_z: float,
+    ) -> int:
+        if not has_min_history or z_score is None:
+            return 0 if not has_min_history else previous_target
+        if z_score > entry_z:
+            return -self.TARGET_SIZE
+        if z_score < -entry_z:
+            return self.TARGET_SIZE
+        return previous_target
+
+    def run(
+        self,
+        state: TradingState,
+        histories: dict[str, list[int]],
+        targets: dict[str, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[str, int]:
+        next_targets: dict[str, int] = {name: targets.get(name, 0) for name, *_ in self.PAIRS}
+        diffs: dict[str, int] = {}
+        active_pairs: list[tuple[str, Symbol, Symbol, int, int, float]] = []
+
+        for pair in self.PAIRS:
+            name, prod_a, prod_b, window, min_history, entry_z = pair
+            depth_a = state.order_depths.get(prod_a)
+            depth_b = state.order_depths.get(prod_b)
+            if depth_a is None or depth_b is None:
+                continue
+            mid_a = mid_price(depth_a)
+            mid_b = mid_price(depth_b)
+            if mid_a is None or mid_b is None:
+                continue
+            diff = int(round((mid_a - mid_b) * self.RESIDUAL_SCALE))
+            history = histories[name]
+            has_min_history = len(history) >= min_history
+            z_score = rolling_spread_z_score(history, diff, window, min_history)
+            next_targets[name] = self.target_from_signal(
+                targets.get(name, 0), z_score, has_min_history, entry_z
+            )
+            diffs[name] = diff
+            active_pairs.append(pair)
+
+        for name, prod_a, prod_b, _, _, _ in active_pairs:
+            target = next_targets[name]
+            orders_a = order_to_target(
+                prod_a,
+                state.order_depths[prod_a],
+                state.position.get(prod_a, 0),
+                target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_a:
+                result[prod_a] = orders_a
+            orders_b = order_to_target(
+                prod_b,
+                state.order_depths[prod_b],
+                state.position.get(prod_b, 0),
+                -target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_b:
+                result[prod_b] = orders_b
+
+        for name, _, _, window, _, _ in active_pairs:
+            history = histories[name]
+            history.append(diffs[name])
+            if len(history) > window:
+                del history[: len(history) - window]
+
+        return next_targets
+
+
+class PanelPairsModule:
+    PAIRS: tuple[tuple[str, Symbol, Symbol, int, int, float], ...] = (
+        ("p1224", "PANEL_1X2", "PANEL_2X4", 1000, 1000, 1.75),
+        ("p2214", "PANEL_2X2", "PANEL_1X4", 4000, 4000, 2.50),
+    )
+    TARGET_SIZE = 10
+    POSITION_LIMIT = 10
+    MAX_ORDER_SIZE = 10
+    RESIDUAL_SCALE = 10
+
+    def empty_state(self) -> tuple[dict[str, list[int]], dict[str, int]]:
+        return (
+            {name: [] for name, *_ in self.PAIRS},
+            {name: 0 for name, *_ in self.PAIRS},
+        )
+
+    def load_state(self, loaded) -> tuple[dict[str, list[int]], dict[str, int]]:
+        histories, targets = self.empty_state()
+        if not isinstance(loaded, dict):
+            return histories, targets
+
+        raw_histories = loaded.get("h", {})
+        if isinstance(raw_histories, dict):
+            for name, _, _, window, _, _ in self.PAIRS:
+                histories[name] = clean_offset_int16_history(raw_histories.get(name, []), window)
+
+        raw_targets = loaded.get("t", {})
+        if isinstance(raw_targets, dict):
+            for name, *_ in self.PAIRS:
+                try:
+                    target = int(raw_targets.get(name, 0))
+                except (TypeError, ValueError):
+                    target = 0
+                targets[name] = clamp(target, -self.TARGET_SIZE, self.TARGET_SIZE)
+
+        return histories, targets
+
+    def dump_state(self, histories: dict[str, list[int]], targets: dict[str, int]) -> dict:
+        return {
+            "h": {
+                name: dump_offset_int16_history(histories.get(name, [])[-window:])
+                for name, _, _, window, *_ in self.PAIRS
+            },
+            "t": {name: int(targets.get(name, 0)) for name, *_ in self.PAIRS},
+        }
+
+    def target_from_signal(
+        self,
+        previous_target: int,
+        z_score: Optional[float],
+        has_min_history: bool,
+        entry_z: float,
+    ) -> int:
+        if not has_min_history or z_score is None:
+            return 0 if not has_min_history else previous_target
+        if z_score > entry_z:
+            return -self.TARGET_SIZE
+        if z_score < -entry_z:
+            return self.TARGET_SIZE
+        return previous_target
+
+    def run(
+        self,
+        state: TradingState,
+        histories: dict[str, list[int]],
+        targets: dict[str, int],
+        result: dict[Symbol, list[Order]],
+    ) -> dict[str, int]:
+        next_targets: dict[str, int] = {name: targets.get(name, 0) for name, *_ in self.PAIRS}
+        diffs: dict[str, int] = {}
+        active_pairs: list[tuple[str, Symbol, Symbol, int, int, float]] = []
+
+        for pair in self.PAIRS:
+            name, prod_a, prod_b, window, min_history, entry_z = pair
+            depth_a = state.order_depths.get(prod_a)
+            depth_b = state.order_depths.get(prod_b)
+            if depth_a is None or depth_b is None:
+                continue
+            mid_a = mid_price(depth_a)
+            mid_b = mid_price(depth_b)
+            if mid_a is None or mid_b is None:
+                continue
+
+            diff = int(round((mid_a - mid_b) * self.RESIDUAL_SCALE))
+            history = histories[name]
+            has_min_history = len(history) >= min_history
+            z_score = rolling_spread_z_score(history, diff, window, min_history)
+            next_targets[name] = self.target_from_signal(
+                targets.get(name, 0), z_score, has_min_history, entry_z
+            )
+            diffs[name] = diff
+            active_pairs.append(pair)
+
+        for name, prod_a, prod_b, _, _, _ in active_pairs:
+            target = next_targets[name]
+            orders_a = order_to_target(
+                prod_a,
+                state.order_depths[prod_a],
+                state.position.get(prod_a, 0),
+                target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_a:
+                result[prod_a] = orders_a
+            orders_b = order_to_target(
+                prod_b,
+                state.order_depths[prod_b],
+                state.position.get(prod_b, 0),
+                -target,
+                self.POSITION_LIMIT,
+                self.MAX_ORDER_SIZE,
+            )
+            if orders_b:
+                result[prod_b] = orders_b
+
+        for name, _, _, window, _, _ in active_pairs:
+            history = histories[name]
+            history.append(diffs[name])
+            if len(history) > window:
+                del history[: len(history) - window]
+
+        return next_targets
+
+
 class Trader:
     PEBBLES_STATE_KEY = "p"
     TRANSLATOR_STATE_KEY = "tr"
     MICROCHIP_STATE_KEY = "mc"
     ROBOT_STATE_KEY = "rb"
+    SNACKPACK_STATE_KEY = "sp"
+    POD_STATE_KEY = "pod"
+    GALAXY_STATE_KEY = "gx"
+    OXYGEN_STATE_KEY = "ox"
+    UV_STATE_KEY = "uv"
+    PANEL_STATE_KEY = "pn"
 
     def __init__(self) -> None:
         self.pebbles = PebblesModule()
         self.translator = TranslatorModule()
         self.microchip = MicrochipModule()
         self.robot = RobotModule()
+        self.snackpack = SnackpackEwmaModule()
+        self.pod = SleepPodModule()
+        self.galaxy = GalaxyPairsModule()
+        self.oxygen = OxygenPairsModule()
+        self.uv = UVVisorPairsModule()
+        self.panel = PanelPairsModule()
 
     def _load_json(self, trader_data: str) -> dict:
         if not trader_data:
@@ -583,6 +1501,16 @@ class Trader:
         )
         microchip_history, microchip_targets = self.microchip.load_state(loaded.get(self.MICROCHIP_STATE_KEY, {}))
         robot_history, robot_targets = self.robot.load_state(loaded.get(self.ROBOT_STATE_KEY, {}))
+        snack_histories, snack_emas, snack_pair_states = self.snackpack.load_state(
+            loaded.get(self.SNACKPACK_STATE_KEY, {})
+        )
+        pod_pc_history, pod_pc_ema, pod_pc_state, pod_ln_history, pod_ln_state = self.pod.load_state(
+            loaded.get(self.POD_STATE_KEY, {})
+        )
+        galaxy_histories, galaxy_targets = self.galaxy.load_state(loaded.get(self.GALAXY_STATE_KEY, {}))
+        oxygen_histories, oxygen_targets = self.oxygen.load_state(loaded.get(self.OXYGEN_STATE_KEY, {}))
+        uv_histories, uv_targets = self.uv.load_state(loaded.get(self.UV_STATE_KEY, {}))
+        panel_histories, panel_targets = self.panel.load_state(loaded.get(self.PANEL_STATE_KEY, {}))
 
         result: dict[Symbol, list[Order]] = {}
 
@@ -590,6 +1518,20 @@ class Trader:
         next_translator_targets = self.translator.run(state, translator_histories, translator_targets, result)
         next_microchip_targets = self.microchip.run(state, microchip_history, microchip_targets, result)
         next_robot_targets = self.robot.run(state, robot_history, robot_targets, result)
+        next_snack_pair_states = self.snackpack.run(state, snack_histories, snack_emas, snack_pair_states, result)
+        next_pod_pc_ema, next_pod_pc_state, next_pod_ln_state = self.pod.run(
+            state,
+            pod_pc_history,
+            pod_pc_ema,
+            pod_pc_state,
+            pod_ln_history,
+            pod_ln_state,
+            result,
+        )
+        next_galaxy_targets = self.galaxy.run(state, galaxy_histories, galaxy_targets, result)
+        next_oxygen_targets = self.oxygen.run(state, oxygen_histories, oxygen_targets, result)
+        next_uv_targets = self.uv.run(state, uv_histories, uv_targets, result)
+        next_panel_targets = self.panel.run(state, panel_histories, panel_targets, result)
 
         trader_data = json.dumps(
             {
@@ -600,6 +1542,22 @@ class Trader:
                 ),
                 self.MICROCHIP_STATE_KEY: self.microchip.dump_state(microchip_history, next_microchip_targets),
                 self.ROBOT_STATE_KEY: self.robot.dump_state(robot_history, next_robot_targets),
+                self.SNACKPACK_STATE_KEY: self.snackpack.dump_state(
+                    snack_histories,
+                    snack_emas,
+                    next_snack_pair_states,
+                ),
+                self.POD_STATE_KEY: self.pod.dump_state(
+                    pod_pc_history,
+                    next_pod_pc_ema,
+                    next_pod_pc_state,
+                    pod_ln_history,
+                    next_pod_ln_state,
+                ),
+                self.GALAXY_STATE_KEY: self.galaxy.dump_state(galaxy_histories, next_galaxy_targets),
+                self.OXYGEN_STATE_KEY: self.oxygen.dump_state(oxygen_histories, next_oxygen_targets),
+                self.UV_STATE_KEY: self.uv.dump_state(uv_histories, next_uv_targets),
+                self.PANEL_STATE_KEY: self.panel.dump_state(panel_histories, next_panel_targets),
             },
             separators=(",", ":"),
         )
