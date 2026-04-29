@@ -195,11 +195,12 @@ Limits are enforced before orders are matched to order depths. If for a product 
 
 ### Position limits
 
-Known Prosperity 4 products are defined in `prosperity4bt/data.py` (`LIMITS`).
+Known products and default limits are defined in `prosperity4bt/data.py` (`LIMITS`).
 
-- Round 0 products: `EMERALDS` = **80**, `TOMATOES` = **80**
-- Round 1 products: `ASH_COATED_OSMIUM` = **80**, `INTARIAN_PEPPER_ROOT` = **80**
-- Round 3/4 products: `HYDROGEL_PACK` = **200**, `VELVETFRUIT_EXTRACT` = **200**, each `VEV_<strike>` voucher = **300**
+Round 5 defaults:
+- The 50 Round 5 products are listed in `LIMITS`
+- Each Round 5 product has a default position limit of **10**
+- In Round 5, products from previous rounds are not tradable in the official environment
 
 Any product not listed there uses a default of **50** until you add it to `LIMITS`.
 

@@ -1,5 +1,4 @@
 import json
-import math
 from typing import Any, Optional
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
@@ -122,26 +121,7 @@ logger = Logger()
 
 
 class Trader:
-    DELTA1_PRODUCTS = ("HYDROGEL_PACK", "VELVETFRUIT_EXTRACT")
-    OPTION_STRIKES = {
-        "VEV_4000": 4000,
-        "VEV_4500": 4500,
-        "VEV_5000": 5000,
-        "VEV_5100": 5100,
-        "VEV_5200": 5200,
-        "VEV_5300": 5300,
-        "VEV_5400": 5400,
-        "VEV_5500": 5500,
-        "VEV_6000": 6000,
-        "VEV_6500": 6500,
-    }
-    POSITION_LIMITS = {
-        "HYDROGEL_PACK": 200,
-        "VELVETFRUIT_EXTRACT": 200,
-        **{symbol: 300 for symbol in OPTION_STRIKES},
-    }
-    TTE_YEARS = 5.0 / 365.0
-    DEFAULT_SIGMA = 0.33
+    POSITION_LIMIT = 10
 
     def _best_bid_ask(self, order_depth: OrderDepth) -> tuple[Optional[int], Optional[int]]:
         best_bid = max(order_depth.buy_orders) if order_depth.buy_orders else None
@@ -158,45 +138,11 @@ class Trader:
             return float(best_bid)
         return (best_bid + best_ask) / 2.0
 
-    def _norm_cdf(self, x: float) -> float:
-        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-    def _call_price(self, spot: float, strike: float, tte: float, sigma: float) -> float:
-        if tte <= 0.0:
-            return max(0.0, spot - strike)
-        sigma = max(1e-4, sigma)
-        sqrt_t = math.sqrt(tte)
-        vol_term = sigma * sqrt_t
-        d1 = (math.log(max(spot, 1e-6) / strike) + 0.5 * sigma * sigma * tte) / vol_term
-        d2 = d1 - vol_term
-        return max(0.0, spot * self._norm_cdf(d1) - strike * self._norm_cdf(d2))
-
-    def _call_delta(self, spot: float, strike: float, tte: float, sigma: float) -> float:
-        if tte <= 0.0:
-            return 1.0 if spot > strike else 0.0
-        sigma = max(1e-4, sigma)
-        d1 = (math.log(max(spot, 1e-6) / strike) + 0.5 * sigma * sigma * tte) / (sigma * math.sqrt(tte))
-        return self._norm_cdf(d1)
-
-    def _implied_vol_from_call(self, target: float, spot: float, strike: float, tte: float) -> float:
-        intrinsic = max(0.0, spot - strike)
-        if target <= intrinsic + 0.01:
-            return 0.05
-        lo, hi = 0.01, 3.0
-        for _ in range(28):
-            mid = 0.5 * (lo + hi)
-            px = self._call_price(spot, strike, tte, mid)
-            if px < target:
-                lo = mid
-            else:
-                hi = mid
-        return 0.5 * (lo + hi)
-
     def _allowable_buy(self, product: Symbol, position: int) -> int:
-        return max(0, self.POSITION_LIMITS[product] - position)
+        return max(0, self.POSITION_LIMIT - position)
 
     def _allowable_sell(self, product: Symbol, position: int) -> int:
-        return max(0, self.POSITION_LIMITS[product] + position)
+        return max(0, self.POSITION_LIMIT + position)
 
     def _place_taking_orders(
         self,
@@ -232,29 +178,22 @@ class Trader:
 
         return orders, position
 
-    def _place_quote_pair(
-        self,
-        product: Symbol,
-        order_depth: OrderDepth,
-        fair_value: float,
-        position: int,
-        width: int,
-        clip: int,
+    def _place_making_orders(
+        self, product: Symbol, order_depth: OrderDepth, fair_value: float, position: int, width: int, clip: int
     ) -> list[Order]:
         orders: list[Order] = []
         best_bid, best_ask = self._best_bid_ask(order_depth)
         if best_bid is None or best_ask is None:
             return orders
 
-        limit = self.POSITION_LIMITS[product]
         buy_capacity = self._allowable_buy(product, position)
         sell_capacity = self._allowable_sell(product, position)
         if buy_capacity <= 0 and sell_capacity <= 0:
             return orders
 
-        inv_skew = position / max(1, limit)
-        buy_quote = min(best_bid + 1, int(fair_value - width - inv_skew * 2.0))
-        sell_quote = max(best_ask - 1, int(fair_value + width - inv_skew * 2.0))
+        inv_skew = position / self.POSITION_LIMIT
+        buy_quote = min(best_bid + 1, int(fair_value - width - inv_skew))
+        sell_quote = max(best_ask - 1, int(fair_value + width - inv_skew))
         if buy_quote >= sell_quote:
             buy_quote, sell_quote = best_bid, best_ask
 
@@ -277,88 +216,37 @@ class Trader:
                 persisted = {}
 
         result: dict[Symbol, list[Order]] = {}
-        mids: dict[str, float] = {}
+        next_state: dict[str, float] = {}
+        debug_rows: list[str] = []
+
         for product, depth in state.order_depths.items():
             mid = self._mid_price(depth)
-            if mid is not None:
-                mids[product] = mid
-
-        # Delta-1 fair values.
-        hydrogel_mid = mids.get("HYDROGEL_PACK", persisted.get("hydrogel_ewma", 10_000.0))
-        hydrogel_fair = 0.9 * persisted.get("hydrogel_ewma", hydrogel_mid) + 0.1 * hydrogel_mid
-        velvet_mid = mids.get("VELVETFRUIT_EXTRACT", persisted.get("velvet_ewma", 5_250.0))
-        velvet_fair = 0.85 * persisted.get("velvet_ewma", velvet_mid) + 0.15 * velvet_mid
-
-        # Estimate implied vol from near-the-money option and smooth it.
-        sigma = persisted.get("sigma", self.DEFAULT_SIGMA)
-        atm_symbol = "VEV_5300"
-        if atm_symbol in mids:
-            sample_sigma = self._implied_vol_from_call(mids[atm_symbol], velvet_fair, 5300.0, self.TTE_YEARS)
-            sigma = 0.8 * sigma + 0.2 * sample_sigma
-
-        # Trade delta-1 products first.
-        for product, fair_value, edge, width, clip in (
-            ("HYDROGEL_PACK", hydrogel_fair, 1.5, 2, 30),
-            ("VELVETFRUIT_EXTRACT", velvet_fair, 1.0, 1, 25),
-        ):
-            depth = state.order_depths.get(product)
-            if depth is None:
+            if mid is None:
                 continue
-            pos = state.position.get(product, 0)
-            orders, post_take_pos = self._place_taking_orders(product, depth, fair_value, pos, edge)
-            orders.extend(self._place_quote_pair(product, depth, fair_value, post_take_pos, width, clip))
-            result[product] = orders
 
-        # Voucher strategy: model-value taking + passive quotes.
-        total_option_delta = 0.0
-        for option_symbol, strike in self.OPTION_STRIKES.items():
-            depth = state.order_depths.get(option_symbol)
-            if depth is None:
-                continue
-            pos = state.position.get(option_symbol, 0)
-            total_option_delta += pos * self._call_delta(velvet_fair, float(strike), self.TTE_YEARS, sigma)
+            key = f"ewma:{product}"
+            previous_fair = persisted.get(key, mid)
+            fair = 0.85 * previous_fair + 0.15 * mid
+            next_state[key] = fair
 
-            theo = self._call_price(velvet_fair, float(strike), self.TTE_YEARS, sigma)
-            market_mid = mids.get(option_symbol, theo)
-            fair = 0.6 * theo + 0.4 * market_mid
+            position = state.position.get(product, 0)
+            take_orders, position_after_take = self._place_taking_orders(
+                product, depth, fair, position, edge=1.0
+            )
+            make_orders = self._place_making_orders(
+                product, depth, fair, position_after_take, width=2, clip=3
+            )
 
-            edge = 1.0 if strike <= 5200 else 0.5
-            orders, post_take_pos = self._place_taking_orders(option_symbol, depth, fair, pos, edge)
-            quote_width = 2 if strike <= 5200 else 1
-            clip = 45 if strike <= 5200 else 35
-            orders.extend(self._place_quote_pair(option_symbol, depth, fair, post_take_pos, quote_width, clip))
-            result[option_symbol] = orders
+            product_orders = take_orders + make_orders
+            if product_orders:
+                result[product] = product_orders
 
-        # Simple soft hedge: skew VELVET fair against aggregate option delta.
-        hedge_product = "VELVETFRUIT_EXTRACT"
-        if hedge_product in state.order_depths:
-            hedge_depth = state.order_depths[hedge_product]
-            hedge_pos = state.position.get(hedge_product, 0)
-            desired_hedge = -int(total_option_delta)
-            gap = desired_hedge - hedge_pos
-            if gap != 0:
-                extra: list[Order] = result.get(hedge_product, [])
-                best_bid, best_ask = self._best_bid_ask(hedge_depth)
-                if best_bid is not None and best_ask is not None:
-                    if gap > 0:
-                        buy_qty = min(gap, self._allowable_buy(hedge_product, hedge_pos), 35)
-                        if buy_qty > 0:
-                            extra.append(Order(hedge_product, best_ask, buy_qty))
-                    else:
-                        sell_qty = min(-gap, self._allowable_sell(hedge_product, hedge_pos), 35)
-                        if sell_qty > 0:
-                            extra.append(Order(hedge_product, best_bid, -sell_qty))
-                result[hedge_product] = extra
+            debug_rows.append(f"{product}:mid={mid:.1f},fair={fair:.1f},pos={position}")
 
-        logger.print(
-            f"hydrogel_fair={hydrogel_fair:.2f} velvet_fair={velvet_fair:.2f} "
-            f"sigma={sigma:.3f} opt_delta={total_option_delta:.1f}"
-        )
+        # Avoid breaching log limits with many products in round 5.
+        logger.print(" | ".join(debug_rows[:8]))
 
-        trader_data = json.dumps(
-            {"hydrogel_ewma": hydrogel_fair, "velvet_ewma": velvet_fair, "sigma": sigma},
-            separators=(",", ":"),
-        )
+        trader_data = json.dumps(next_state, separators=(",", ":"))
         conversions = 0
 
         logger.flush(state, result, conversions, trader_data)
