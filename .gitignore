@@ -175,8 +175,11 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 
-# Default output directory
-backtests/
+# Generated R5 outputs
+backtests/*
+!backtests/.gitkeep
+research_outputs/*
+!research_outputs/.gitkeep
 
 # macOS files
 .DS_Store

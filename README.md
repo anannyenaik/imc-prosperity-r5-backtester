@@ -7,6 +7,63 @@ This repository contains a backtester for [IMC Prosperity 4](https://prosperity.
 
 PyPI package: [prosperity4btest](https://pypi.org/project/prosperity4btest/)
 
+## R5 Final Strategy
+
+Result: the final production file is `strategies/r5_trader.py`.
+
+It contains the frozen combined R5 strategy with separate module logic for:
+- Pebbles: `PEBBLES_XS`, `PEBBLES_S`, `PEBBLES_M`, `PEBBLES_L`, `PEBBLES_XL`
+- Translator: `TRANSLATOR_SPACE_GRAY`, `TRANSLATOR_ASTRO_BLACK`, `TRANSLATOR_ECLIPSE_CHARCOAL`, `TRANSLATOR_GRAPHITE_MIST`, `TRANSLATOR_VOID_BLUE`
+- Microchip: `MICROCHIP_OVAL`, `MICROCHIP_TRIANGLE`
+
+The standalone module references are kept in `strategies/archive/`. Research and validation scripts live in `research/`. Generated logs belong in `backtests/`; generated summaries belong in `research_outputs/`. Those generated outputs are ignored by default.
+
+Expected public Round 5 PnL for `strategies/r5_trader.py`, using days 2, 3 and 4 with `--match-trades worse`:
+- Day 2: `236,819`
+- Day 3: `126,476`
+- Day 4: `222,473`
+- Total: `585,768`
+
+Standalone module totals used for additivity checks:
+- Pebbles: `363,835`
+- Translator: `106,263`
+- Microchip: `115,670`
+
+Run the final backtest from the repository root:
+
+```powershell
+python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades worse --merge-pnl --out backtests/r5_trader_worse.log --no-progress
+```
+
+Exact final validation commands:
+
+```powershell
+python -m compileall prosperity4bt strategies research
+
+$limits = @(
+  "--limit", "PEBBLES_XS:10",
+  "--limit", "PEBBLES_S:10",
+  "--limit", "PEBBLES_M:10",
+  "--limit", "PEBBLES_L:10",
+  "--limit", "PEBBLES_XL:10",
+  "--limit", "TRANSLATOR_SPACE_GRAY:10",
+  "--limit", "TRANSLATOR_ASTRO_BLACK:10",
+  "--limit", "TRANSLATOR_ECLIPSE_CHARCOAL:10",
+  "--limit", "TRANSLATOR_GRAPHITE_MIST:10",
+  "--limit", "TRANSLATOR_VOID_BLUE:10",
+  "--limit", "MICROCHIP_OVAL:10",
+  "--limit", "MICROCHIP_TRIANGLE:10"
+)
+
+foreach ($mode in "worse", "all", "none") {
+  python -m prosperity4bt cli strategies/r5_trader.py 5-2 5-3 5-4 --data r5_data --match-trades $mode --merge-pnl --out "backtests/r5_trader_$mode.log" --no-progress @limits
+}
+
+python research/r5_combined_validation.py
+```
+
+The production strategy does not use timestamp logic, day logic, warm starts, public-history seeds, passive orders, L2 book logic, or extra traded products.
+
 ## Usage
 
 Basic usage:
